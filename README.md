@@ -1,1 +1,6 @@
-# milkcoin
+# build
+yarn
+
+# test
+yarn test
+
