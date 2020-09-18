@@ -13,10 +13,11 @@ contract MilkChef is Ownable {
     using SafeERC20 for IERC20;
     struct UserInfo {
         uint256 amount;     // How many LP tokens the user has provided.
+        mapping (uint256 => uint256) lpAmounts; // each lp token's amount, sum of all these amount equals to the amount field.
         uint256 rewardDebt; // Reward debt. See explanation below.
     }
     struct PoolInfo {
-        IERC20 lpToken;           // Address of LP token contract.
+        IERC20[] lpTokens;           // Address of LP token contracts.
         uint256 allocPoint;       // How many allocation points assigned to this pool. MILKs to distribute per block.
         uint256 lastRewardBlock;  // Last block number that MILKs distribution occurs.
         uint256 accMilkPerShare; // Accumulated MILKs per share, times 1e12. See below.
@@ -30,8 +31,8 @@ contract MilkChef is Ownable {
     mapping (uint256 => mapping (address => UserInfo)) public userInfo;
     uint256 public totalAllocPoint = 0;
     uint256 public startBlock;
-    event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
-    event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
+    event Deposit(address indexed user, uint256 indexed pid, uint256 cid, uint256 amount);
+    event Withdraw(address indexed user, uint256 indexed pid, uint256 cid, uint256 amount);
     event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount);
     constructor( MilkToken _milk, uint256 _milkPerBlock, uint256 _startBlock, uint256 _bonusEndBlock) public {
         milk = _milk;
@@ -42,19 +43,33 @@ contract MilkChef is Ownable {
     function poolLength() external view returns (uint256) {
         return poolInfo.length;
     }
-    function add(uint256 _allocPoint, IERC20 _lpToken, bool _withUpdate) public onlyOwner {
+
+    /* get the lp token's length in one pool */
+    function lpTokenLength(uint256 _pid) external view returns (uint256) {
+        PoolInfo storage pool = poolInfo[_pid];
+        return pool.lpTokens.length;
+    }
+
+    function add(uint256 _allocPoint, IERC20[] calldata _lpTokens, bool _withUpdate) public onlyOwner {
         if (_withUpdate) {
             massUpdatePools();
         }
         uint256 lastRewardBlock = block.number > startBlock ? block.number : startBlock;
         totalAllocPoint = totalAllocPoint.add(_allocPoint);
         poolInfo.push(PoolInfo({
-            lpToken: _lpToken,
+            lpTokens: _lpTokens,
             allocPoint: _allocPoint,
             lastRewardBlock: lastRewardBlock,
             accMilkPerShare: 0
         }));
     }
+
+    /* add new lp tokens to a pool, all the lp tokens have the same weight */
+    function addNewLP(uint256 _pid, IERC20 _lpToken) public onlyOwner {
+        PoolInfo storage pool = poolInfo[_pid];
+        pool.lpTokens.push(_lpToken);
+    }
+
     function set(uint256 _pid, uint256 _allocPoint, bool _withUpdate) public onlyOwner {
         if (_withUpdate) {
             massUpdatePools();
@@ -68,12 +83,15 @@ contract MilkChef is Ownable {
     function migrate(uint256 _pid) public {
         require(address(migrator) != address(0), "migrate: no migrator");
         PoolInfo storage pool = poolInfo[_pid];
-        IERC20 lpToken = pool.lpToken;
-        uint256 bal = lpToken.balanceOf(address(this));
-        lpToken.safeApprove(address(migrator), bal);
-        IERC20 newLpToken = migrator.migrate(lpToken);
-        require(bal == newLpToken.balanceOf(address(this)), "migrate: bad");
-        pool.lpToken = newLpToken;
+        IERC20[] storage lpTokens = pool.lpTokens;
+        for (uint i = 0; i < lpTokens.length; i++){
+            IERC20 lpToken = lpTokens[i];
+            uint256 bal = lpToken.balanceOf(address(this));
+            lpToken.safeApprove(address(migrator), bal);
+            IERC20 newLpToken = migrator.migrate(lpToken);
+            require(bal == newLpToken.balanceOf(address(this)), "migrate: bad");
+            lpTokens[i] = newLpToken;
+        }
     }
     function getMultiplier(uint256 _from, uint256 _to) public view returns (uint256) {
         if (_to <= bonusEndBlock) {
@@ -90,7 +108,7 @@ contract MilkChef is Ownable {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_user];
         uint256 accMilkPerShare = pool.accMilkPerShare;
-        uint256 lpSupply = pool.lpToken.balanceOf(address(this));
+        uint256 lpSupply = getBalance(pool.lpTokens);
         if (block.number > pool.lastRewardBlock && lpSupply != 0) {
             uint256 multiplier = getMultiplier(pool.lastRewardBlock, block.number);
             uint256 milkReward = multiplier.mul(milkPerBlock).mul(pool.allocPoint).div(totalAllocPoint);
@@ -109,7 +127,7 @@ contract MilkChef is Ownable {
         if (block.number <= pool.lastRewardBlock) {
             return;
         }
-        uint256 lpSupply = pool.lpToken.balanceOf(address(this));
+        uint256 lpSupply = getBalance(pool.lpTokens);
         if (lpSupply == 0) {
             pool.lastRewardBlock = block.number;
             return;
@@ -120,7 +138,7 @@ contract MilkChef is Ownable {
         pool.accMilkPerShare = pool.accMilkPerShare.add(milkReward.mul(1e12).div(lpSupply));
         pool.lastRewardBlock = block.number;
     }
-    function deposit(uint256 _pid, uint256 _amount) public {
+    function deposit(uint256 _pid, uint256 _cid, uint256 _amount) public {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
         updatePool(_pid);
@@ -128,12 +146,13 @@ contract MilkChef is Ownable {
             uint256 pending = user.amount.mul(pool.accMilkPerShare).div(1e12).sub(user.rewardDebt);
             safeMilkTransfer(msg.sender, pending);
         }
-        pool.lpToken.safeTransferFrom(address(msg.sender), address(this), _amount);
+        pool.lpTokens[_cid].safeTransferFrom(address(msg.sender), address(this), _amount);
         user.amount = user.amount.add(_amount);
+        user.lpAmounts[_cid] = user.lpAmounts[_cid].add(_amount);
         user.rewardDebt = user.amount.mul(pool.accMilkPerShare).div(1e12);
-        emit Deposit(msg.sender, _pid, _amount);
+        emit Deposit(msg.sender, _pid, _cid, _amount);
     }
-    function withdraw(uint256 _pid, uint256 _amount) public {
+    function withdraw(uint256 _pid, uint256 _cid, uint256 _amount) public {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
         require(user.amount >= _amount, "withdraw: not good");
@@ -141,14 +160,18 @@ contract MilkChef is Ownable {
         uint256 pending = user.amount.mul(pool.accMilkPerShare).div(1e12).sub(user.rewardDebt);
         safeMilkTransfer(msg.sender, pending);
         user.amount = user.amount.sub(_amount);
+        user.lpAmounts[_cid] = user.lpAmounts[_cid].sub(_amount);
         user.rewardDebt = user.amount.mul(pool.accMilkPerShare).div(1e12);
-        pool.lpToken.safeTransfer(address(msg.sender), _amount);
-        emit Withdraw(msg.sender, _pid, _amount);
+        pool.lpTokens[_cid].safeTransfer(address(msg.sender), _amount);
+        emit Withdraw(msg.sender, _pid, _cid, _amount);
     }
     function emergencyWithdraw(uint256 _pid) public {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
-        pool.lpToken.safeTransfer(address(msg.sender), user.amount);
+        for (uint i = 0; i < pool.lpTokens.length; i++){
+            pool.lpTokens[i].safeTransfer(address(msg.sender), user.lpAmounts[i]);
+            user.lpAmounts[i] = 0;
+        }
         emit EmergencyWithdraw(msg.sender, _pid, user.amount);
         user.amount = 0;
         user.rewardDebt = 0;
@@ -161,4 +184,15 @@ contract MilkChef is Ownable {
             milk.transfer(_to, _amount);
         }
     }
+
+    /* loop to get the sum balance of array of lp tokens */
+    function getBalance(IERC20[] memory _lpTokens) internal view returns (uint256){
+        uint256 totalAmount = 0;
+        for (uint i = 0; i < _lpTokens.length; i++){
+            uint256 bal = _lpTokens[i].balanceOf(address(this));
+            totalAmount = totalAmount + bal;
+        }
+        return totalAmount;
+    }
+
 }
